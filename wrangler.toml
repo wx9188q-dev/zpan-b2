@@ -1,3 +1,4 @@
+
 name = "zpan"
 main = "./workers/bootstrap.ts"
 compatibility_date = "2026-04-12"
@@ -55,13 +56,6 @@ max_batch_size = 1
 max_batch_timeout = 1
 max_retries = 3
 
-# Self-hosted avatar storage. When present, avatars upload straight to R2 (served from
-# /api/avatar-blobs, or from PUBLIC_IMAGES_URL if an R2 custom domain is configured)
-# instead of the ZPan Cloud avatar service.
-[[r2_buckets]]
-binding = "PUBLIC_IMAGES"
-bucket_name = "zpan-public-images"
-
 [observability]
 enabled = true
 
@@ -98,10 +92,6 @@ namespace_id = "2802"
 [previews.ratelimits.simple]
 limit = 3600
 period = 60
-
-[[previews.r2_buckets]]
-binding = "PUBLIC_IMAGES"
-bucket_name = "zpan-public-images-staging"
 
 [[previews.send_email]]
 name = "EMAIL"
