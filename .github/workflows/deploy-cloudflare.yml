@@ -1,15 +1,9 @@
+
 name: Deploy to Cloudflare Workers
 
-# Triggered by the top-level Deploy dispatcher (.github/workflows/deploy.yml)
-# when CF secrets are configured. Manual runs via the Actions UI also
-# supported.
 on:
   workflow_call:
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release tag to deploy (e.g. v2.1.0). Leave empty for latest.'
-        required: false
 
 # Prevent overlapping deployments.
 concurrency:
@@ -23,15 +17,11 @@ jobs:
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
+
     steps:
-      - name: Disable upstream-only workflows
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for workflow in ci.yml release.yml; do
-            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/$workflow/disable" 2>/dev/null && \
-              echo "Disabled $workflow" || echo "$workflow already disabled"
-          done
+      # Checkout the exact repository and branch that triggered this workflow.
+      - name: Checkout B2-enabled repository
+        uses: actions/checkout@v6
 
       - name: Check required secrets
         env:
@@ -39,81 +29,82 @@ jobs:
           HAS_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID != '' }}
         run: |
           if [ "$HAS_TOKEN" != "true" ] || [ "$HAS_ACCOUNT" != "true" ]; then
-            echo "::error::Missing required secrets. Go to Settings → Secrets and variables → Actions and add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID."
+            echo "::error::Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID."
             exit 1
           fi
 
-      - name: Resolve release tag
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$INPUT_VERSION" ]; then
-            TAG="$INPUT_VERSION"
-          else
-            TAG=$(gh api repos/saltbo/zpan/releases/latest --jq '.tag_name')
-          fi
-          if [ -z "$TAG" ]; then
-            echo "::error::No release found in saltbo/zpan"
-            exit 1
-          fi
-          echo "version=$TAG" >> "$GITHUB_OUTPUT"
-          echo "### 🚀 Deploying $TAG" >> "$GITHUB_STEP_SUMMARY"
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
 
-      - uses: actions/checkout@v6
-        with:
-          repository: saltbo/zpan
-          ref: ${{ steps.release.outputs.version }}
-
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
 
-      - run: pnpm install --frozen-lockfile
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
+      # Create or reuse the production D1 database.
       - name: Ensure D1 database exists
         id: d1
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          DB_ID=$(pnpm exec wrangler d1 list --json | jq -r '.[] | select(.name == "zpan-db") | .uuid')
+          set -euo pipefail
+
+          DB_ID=$(pnpm exec wrangler d1 list --json \
+            | jq -r '.[] | select(.name == "zpan-db") | .uuid' \
+            | head -n 1)
+
           if [ -z "$DB_ID" ]; then
-            # wrangler d1 create does not support --json; parse the TOML snippet it prints.
-            DB_ID=$(pnpm exec wrangler d1 create zpan-db | awk -F'"' '/database_id/{print $2; exit}')
-            echo "Created D1 database: $DB_ID"
-          else
-            echo "Reusing D1 database: $DB_ID"
+            OUTPUT=$(pnpm exec wrangler d1 create zpan-db 2>&1)
+            echo "$OUTPUT"
+            DB_ID=$(printf '%s\n' "$OUTPUT" \
+              | sed -nE 's/.*database_id[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+              | head -n 1)
           fi
+
           if [ -z "$DB_ID" ]; then
-            echo "::error::Failed to obtain D1 database UUID"
+            echo "::error::Failed to obtain D1 database ID."
             exit 1
           fi
-          echo "id=$DB_ID" >> "$GITHUB_OUTPUT"
 
+          echo "id=$DB_ID" >> "$GITHUB_OUTPUT"
+          echo "Production D1 database ID obtained."
+
+      # Create or reuse the production KV namespace.
       - name: Ensure cache KV namespace exists
         id: kv
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          KV_ID=$(pnpm exec wrangler kv namespace list | jq -r '.[] | select(.title == "zpan-cache") | .id')
+          set -euo pipefail
+
+          KV_ID=$(pnpm exec wrangler kv namespace list \
+            | jq -r '.[] | select(.title == "zpan-cache") | .id' \
+            | head -n 1)
+
           if [ -z "$KV_ID" ]; then
             KV_ID=$(curl --fail-with-body -sS -X POST \
               "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces" \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               -H "Content-Type: application/json" \
-              -d '{"title":"zpan-cache"}' | jq -er '.result.id')
+              -d '{"title":"zpan-cache"}' \
+              | jq -er '.result.id')
           fi
+
           if [[ ! "$KV_ID" =~ ^[a-f0-9]{32}$ ]]; then
-            echo "::error::Failed to obtain cache KV namespace ID. Check Workers KV Storage:Edit permission."
+            echo "::error::Invalid KV namespace ID."
             exit 1
           fi
-          echo "id=$KV_ID" >> "$GITHUB_OUTPUT"
 
+          echo "id=$KV_ID" >> "$GITHUB_OUTPUT"
+          echo "Production KV namespace ID obtained."
+
+      # Update only the production CACHE_KV binding.
       - name: Patch production cache KV binding
         env:
           KV_ID: ${{ steps.kv.outputs.id }}
@@ -125,141 +116,156 @@ jobs:
 
           path = Path("wrangler.toml")
           config = path.read_text()
-          pattern = r'(\[\[kv_namespaces\]\]\s*binding = "CACHE_KV"\s*id = ")[^"]*(")'
-          config, count = re.subn(pattern, lambda match: match[1] + os.environ["KV_ID"] + match[2], config)
+
+          pattern = (
+              r'(\[\[kv_namespaces\]\]\s*'
+              r'binding\s*=\s*"CACHE_KV"\s*'
+              r'id\s*=\s*")[^"]*(")'
+          )
+
+          updated, count = re.subn(
+              pattern,
+              lambda m: m.group(1) + os.environ["KV_ID"] + m.group(2),
+              config,
+              count=1,
+          )
+
           if count != 1:
-              raise SystemExit("Expected exactly one production CACHE_KV binding")
-          path.write_text(config)
+              raise SystemExit(
+                  "Expected exactly one production CACHE_KV binding."
+              )
+
+          path.write_text(updated)
+          print("Production CACHE_KV binding updated.")
           PYTHON
 
+      # Update only the production D1 database ID.
+      # Preview database IDs remain untouched.
+      - name: Patch production D1 database binding
+        env:
+          DB_ID: ${{ steps.d1.outputs.id }}
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("wrangler.toml")
+          config = path.read_text()
+
+          marker = "\n[previews]"
+          if marker not in config:
+              raise SystemExit("Preview configuration not found.")
+
+          production, preview = config.split(marker, 1)
+
+          pattern = (
+              r'(\[\[d1_databases\]\]\s*'
+              r'binding\s*=\s*"DB"\s*'
+              r'database_name\s*=\s*"zpan-db"\s*'
+              r'database_id\s*=\s*")[^"]*(")'
+          )
+
+          updated, count = re.subn(
+              pattern,
+              lambda m: m.group(1) + os.environ["DB_ID"] + m.group(2),
+              production,
+              count=1,
+          )
+
+          if count != 1:
+              raise SystemExit(
+                  "Expected exactly one production zpan-db binding."
+              )
+
+          path.write_text(updated + marker + preview)
+          print("Production D1 binding updated; Preview binding preserved.")
+          PYTHON
+
+      # Create or reuse the archive queue.
       - name: Ensure Queue exists
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          set -euo pipefail
+
           OUTPUT=$(pnpm exec wrangler queues create zpan-archive-jobs 2>&1) || true
-          if echo "$OUTPUT" | grep -q "already taken"; then
-            echo "Queue already exists, skipping"
-          elif echo "$OUTPUT" | grep -q "ERROR"; then
-            echo "$OUTPUT"
+          echo "$OUTPUT"
+
+          if echo "$OUTPUT" | grep -Eiq \
+            "already exists|already taken|already in use"; then
+            echo "Queue already exists; reusing it."
+          elif echo "$OUTPUT" | grep -Eiq "error|failed"; then
+            echo "::error::Failed to create or verify queue."
             exit 1
           else
-            echo "Created queue: zpan-archive-jobs"
+            echo "Queue creation command completed."
           fi
 
-      # Avatars are self-hosted in R2 on Workers (the PUBLIC_IMAGES binding). Provision the
-      # bucket so the binding resolves, expose its managed public URL, and pin it to
-      # PUBLIC_IMAGES_URL so prod serves avatars straight from R2 (zero Worker egress);
-      # without the secret the app falls back to its own /api/avatar-blobs route.
-      - name: Ensure R2 public-images bucket exists
-        env:
-          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          EXISTS=$(curl -sf \
-            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            | jq -r '.result.buckets[]? | select(.name == "zpan-public-images") | .name')
-          if [ -z "$EXISTS" ]; then
-            curl -sf -X POST \
-              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets" \
-              -H "Authorization: Bearer $CF_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d '{"name": "zpan-public-images"}' > /dev/null
-            echo "Created R2 bucket: zpan-public-images"
-          else
-            echo "Reusing R2 bucket: zpan-public-images"
-          fi
-
-      - name: Enable R2 managed public URL + capture
-        id: r2
-        env:
-          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          # Idempotent: PUT enabled=true — CF returns the same pub-<hash>.r2.dev
-          # on every call once enabled.
-          curl -sf -X PUT \
-            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/zpan-public-images/domains/managed" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d '{"enabled": true}' > /dev/null
-
-          DOMAIN=$(curl -sf \
-            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/zpan-public-images/domains/managed" \
-            -H "Authorization: Bearer $CF_API_TOKEN" | jq -r '.result.domain')
-
-          if [ -z "$DOMAIN" ] || [ "$DOMAIN" = "null" ]; then
-            echo "::error::Failed to retrieve R2 managed public domain. Make sure CLOUDFLARE_API_TOKEN has 'R2 Storage: Edit' scope."
-            exit 1
-          fi
-          echo "url=https://$DOMAIN" >> "$GITHUB_OUTPUT"
-          echo "R2 public URL: https://$DOMAIN"
-
-      - name: Set PUBLIC_IMAGES_URL (always upsert — R2 domain is stable)
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          echo "${{ steps.r2.outputs.url }}" | pnpm exec wrangler secret put PUBLIC_IMAGES_URL
-          echo "Set PUBLIC_IMAGES_URL = ${{ steps.r2.outputs.url }}"
-
-      - name: Patch wrangler.toml with D1 database ID
-        run: sed -i "s/database_id = \"[^\"]*\"/database_id = \"${{ steps.d1.outputs.id }}\"/" wrangler.toml
-
-      - name: Set BETTER_AUTH_SECRET (first deploy only)
+      # Set authentication secret.
+      - name: Ensure BETTER_AUTH_SECRET
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           USER_SECRET: ${{ secrets.BETTER_AUTH_SECRET }}
         run: |
-          EXISTS=$(pnpm exec wrangler secret list --format json | jq -r '.[] | select(.name == "BETTER_AUTH_SECRET") | .name')
+          set -euo pipefail
+
+          EXISTS=$(pnpm exec wrangler secret list --format json \
+            | jq -r '.[] | select(.name == "BETTER_AUTH_SECRET") | .name')
+
           if [ -n "$USER_SECRET" ]; then
-            echo "$USER_SECRET" | pnpm exec wrangler secret put BETTER_AUTH_SECRET
-            echo "Set BETTER_AUTH_SECRET from GitHub secret"
+            printf '%s' "$USER_SECRET" \
+              | pnpm exec wrangler secret put BETTER_AUTH_SECRET
+            echo "BETTER_AUTH_SECRET configured from GitHub Secrets."
           elif [ -z "$EXISTS" ]; then
-            openssl rand -base64 32 | pnpm exec wrangler secret put BETTER_AUTH_SECRET
-            echo "Auto-generated BETTER_AUTH_SECRET"
+            openssl rand -base64 32 \
+              | pnpm exec wrangler secret put BETTER_AUTH_SECRET
+            echo "BETTER_AUTH_SECRET generated."
           else
-            echo "BETTER_AUTH_SECRET already set, skipping"
+            echo "Existing BETTER_AUTH_SECRET preserved."
           fi
 
-      # vite build runs the @cloudflare/vite-plugin, which writes the deploy
-      # config (dist/zpan/wrangler.json) that the subsequent wrangler deploy
-      # consumes: it resolves the assets directory to dist/client and inlines
-      # build-time defines. Must run after the D1 id patch so the generated
-      # config carries the real database_id. ZPAN_APP_VERSION sidesteps a git
-      # describe on the shallow tag checkout.
+      # Build the current B2-enabled branch.
       - name: Build
         env:
-          ZPAN_APP_VERSION: ${{ steps.release.outputs.version }}
+          ZPAN_APP_VERSION: ${{ github.ref_name }}
           ZPAN_APP_COMMIT: ${{ github.sha }}
         run: pnpm build
 
+      # Deploy the Worker and apply production D1 migrations.
       - name: Deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: pnpm run deploy
 
+      # Reset stale WebDAV verification state.
       - name: Clear WebDAV domain readiness
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          set -euo pipefail
+
           pnpm exec wrangler d1 execute zpan-db --remote --command \
             "INSERT INTO system_options (key, value) VALUES ('webdav_verified_origin', ''), ('webdav_verified_at', ''), ('webdav_verification_error', '') ON CONFLICT(key) DO UPDATE SET value = excluded.value"
 
+      # Reconcile the WebDAV domain.
       - name: Reconcile fixed WebDAV domain
         id: webdav
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          set -euo pipefail
+
           OUTPUT=$(node scripts/sync-cloudflare-webdav.mjs)
           echo "$OUTPUT"
           printf '%s\n' "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
 
+      # Record WebDAV verification state.
       - name: Record WebDAV domain readiness
         if: steps.webdav.outputs.origin != ''
         env:
@@ -267,11 +273,16 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           WEBDAV_ORIGIN: ${{ steps.webdav.outputs.origin }}
         run: |
+          set -euo pipefail
+
           if [[ ! "$WEBDAV_ORIGIN" =~ ^https://[A-Za-z0-9.-]+$ ]]; then
-            echo "::error::Invalid WebDAV origin returned by deployment sync"
+            echo "::error::Invalid WebDAV origin."
             exit 1
           fi
+
           VERIFIED_AT=$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')
+
           pnpm exec wrangler d1 execute zpan-db --remote --command \
             "INSERT INTO system_options (key, value) VALUES ('webdav_verified_origin', '$WEBDAV_ORIGIN'), ('webdav_verified_at', '$VERIFIED_AT'), ('webdav_verification_error', '') ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-          echo "WebDAV readiness recorded for $WEBDAV_ORIGIN" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "WebDAV readiness recorded." >> "$GITHUB_STEP_SUMMARY"
